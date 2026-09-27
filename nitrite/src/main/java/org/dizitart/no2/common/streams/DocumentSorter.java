@@ -1,0 +1,103 @@
+/*
+ * Copyright (c) 2017-2021 Nitrite author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+package org.dizitart.no2.common.streams;
+
+import org.dizitart.no2.collection.Document;
+import org.dizitart.no2.collection.NitriteId;
+import org.dizitart.no2.common.DBNull;
+import org.dizitart.no2.common.SortOrder;
+import org.dizitart.no2.common.tuples.Pair;
+import org.dizitart.no2.exceptions.InvalidOperationException;
+
+import java.text.Collator;
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * @author Anindya Chatterjee
+ * @since 4.0
+ */
+public class DocumentSorter implements Comparator<Pair<NitriteId, Document>> {
+    private final Collator collator;
+    private final List<Pair<String, SortOrder>> sortOrder;
+
+    public DocumentSorter(Collator collator, List<Pair<String, SortOrder>> sortOrder) {
+        this.collator = collator;
+        this.sortOrder = sortOrder;
+    }
+
+    @Override
+    public int compare(Pair<NitriteId, Document> pair1, Pair<NitriteId, Document> pair2) {
+        if (sortOrder != null && !sortOrder.isEmpty()) {
+            for (Pair<String, SortOrder> pair : sortOrder) {
+                Document doc1 = pair1.getSecond();
+                Document doc2 = pair2.getSecond();
+
+                int result = compareValues(doc1.get(pair.getFirst()), doc2.get(pair.getFirst()), collator);
+
+                if (pair.getSecond() == SortOrder.Descending) {
+                    result *= -1;
+                }
+
+                // if both values are equal, continue to next sort order
+                if (result != 0) {
+                    return result;
+                }
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Orders two values of a sort field the way an {@code orderBy} does: null (or missing)
+     * before everything else, strings through the collator when one was given, everything
+     * else by its natural order.
+     *
+     * <p>Shared with the index-ordered sort path, which reads the same keys out of an index
+     * instead of out of the documents - the two orderings must not drift apart.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static int compareValues(Object value1, Object value2, Collator collator) {
+        boolean isNull1 = value1 == null || value1 instanceof DBNull;
+        boolean isNull2 = value2 == null || value2 instanceof DBNull;
+        if (isNull1 && isNull2) {
+            // two null keys are equal, otherwise the comparator
+            // violates antisymmetry and TimSort may throw
+            return 0;
+        } else if (isNull1) {
+            return -1;
+        } else if (isNull2) {
+            return 1;
+        }
+
+        // validate comparable
+        if (!(value1 instanceof Comparable) || !(value2 instanceof Comparable)) {
+            throw new InvalidOperationException("Cannot compare " + value1.getClass()
+                + " and " + value2.getClass());
+        }
+
+        // compare values
+        Comparable c1 = (Comparable) value1;
+        Comparable c2 = (Comparable) value2;
+
+        if (c1 instanceof String && c2 instanceof String && collator != null) {
+            return collator.compare(c1, c2);
+        }
+        return c1.compareTo(c2);
+    }
+}

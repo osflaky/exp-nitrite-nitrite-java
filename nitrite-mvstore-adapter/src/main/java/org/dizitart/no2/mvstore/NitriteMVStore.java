@@ -1,0 +1,310 @@
+/*
+ * Copyright (c) 2019-2020. Nitrite author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.dizitart.no2.mvstore;
+
+
+import static org.h2.mvstore.DataUtils.ERROR_BLOCK_NOT_FOUND;
+import static org.h2.mvstore.DataUtils.ERROR_CHUNK_NOT_FOUND;
+import static org.h2.mvstore.DataUtils.ERROR_FILE_CORRUPT;
+import static org.h2.mvstore.DataUtils.ERROR_READING_FAILED;
+import static org.h2.mvstore.DataUtils.ERROR_SERIALIZATION;
+import static org.h2.mvstore.DataUtils.ERROR_WRITING_FAILED;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.dizitart.no2.common.util.StringUtils;
+import org.dizitart.no2.exceptions.NitriteIOException;
+import org.dizitart.no2.index.BoundingBox;
+import org.dizitart.no2.store.AbstractNitriteStore;
+import org.dizitart.no2.store.NitriteMap;
+import org.dizitart.no2.store.NitriteRTree;
+import org.dizitart.no2.store.events.StoreEventListener;
+import org.dizitart.no2.store.events.StoreEvents;
+import org.h2.mvstore.MVMap;
+import org.h2.mvstore.MVStore;
+import org.h2.mvstore.MVStoreException;
+import org.h2.mvstore.rtree.MVRTreeMap;
+import org.h2.mvstore.type.DataType;
+import org.h2.mvstore.type.ObjectDataType;
+
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * @author Anindya Chatterjee
+ * @since 1.0
+ */
+@Slf4j
+public class NitriteMVStore extends AbstractNitriteStore<MVStoreConfig> {
+
+    private static final String COMPACT_THREADS_PROPERTY = "h2.compactThreads";
+    private static final Object COMPACT_THREADS_LOCK = new Object();
+    // any object H2 has no dedicated type for; see settleKeyType
+    private static final Object SERIALIZED_KEY_SAMPLE = new Object();
+
+    private MVStore mvStore;
+    private final Map<String, NitriteMap<?, ?>> nitriteMapRegistry;
+    private final Map<String, NitriteRTree<?, ?>> nitriteRTreeMapRegistry;
+    private volatile boolean autoCommitPending;
+
+    public NitriteMVStore() {
+        super();
+        this.nitriteMapRegistry = new ConcurrentHashMap<>();
+        this.nitriteRTreeMapRegistry = new ConcurrentHashMap<>();
+    }
+
+    @Override
+    public void openOrCreate() {
+        // MVStoreUtils always opens with auto-commit disabled; it is enabled lazily
+        // right after the very first map is created (see enableAutoCommitIfPending()),
+        // so the background writer never races with bootstrapping a brand new store
+        this.autoCommitPending = getStoreConfig().autoCommit();
+        this.mvStore = MVStoreUtils.openOrCreate(getStoreConfig());
+        initEventBus();
+        alert(StoreEvents.Opened);
+    }
+
+    private void enableAutoCommitIfPending() {
+        if (autoCommitPending) {
+            autoCommitPending = false;
+            mvStore.commit();
+            mvStore.setAutoCommitDelay(1000);
+        }
+    }
+
+    @Override
+    public boolean isClosed() {
+        return mvStore == null || mvStore.isClosed();
+    }
+
+    @Override
+    public boolean hasUnsavedChanges() {
+        return mvStore != null && mvStore.hasUnsavedChanges();
+    }
+
+    @Override
+    public boolean isReadOnly() {
+        return mvStore.isReadOnly();
+    }
+
+    @Override
+    public void commit() {
+        // pause the background writer for the duration of this explicit commit;
+        // H2's autocommit thread and an explicit commit() racing on the same store
+        // can trip an internal MVStore assertion (concurrent chunk serialization)
+        int delay = mvStore.getAutoCommitDelay();
+        if (delay > 0) {
+            mvStore.setAutoCommitDelay(0);
+        }
+        try {
+            mvStore.commit();
+        } finally {
+            if (delay > 0) {
+                mvStore.setAutoCommitDelay(delay);
+            }
+        }
+        alert(StoreEvents.Commit);
+    }
+
+    @Override
+    public void close() {
+        // close nitrite maps
+        for (NitriteMap<?, ?> nitriteMap : nitriteMapRegistry.values()) {
+            nitriteMap.close();
+        }
+
+        for (NitriteRTree<?, ?> rTree : nitriteRTreeMapRegistry.values()) {
+            rTree.close();
+        }
+
+        nitriteMapRegistry.clear();
+        nitriteRTreeMapRegistry.clear();
+
+        if (getStoreConfig().autoCompact()) {
+            compactAndClose();
+        } else {
+            mvStore.close();
+        }
+        alert(StoreEvents.Closed);
+        eventBus.close();
+    }
+
+    @Override
+    public boolean hasMap(String mapName) {
+        return mvStore.hasMap(mapName);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <Key, Value> NitriteMap<Key, Value> openMap(String mapName, Class<?> keyType, Class<?> valueType) {
+        // one wrapper per map, however many threads open it at once, so a drop() or close()
+        // through any holder is the drop or close every holder sees
+        return (NitriteMVMap<Key, Value>) nitriteMapRegistry.computeIfAbsent(mapName, name -> {
+            MVMap<Key, Value> mvMap = openMVMap(name, null);
+            return new NitriteMVMap<>(mvMap, this);
+        });
+    }
+
+    @Override
+    public void closeMap(String mapName) {
+        if (!StringUtils.isNullOrEmpty(mapName)) {
+            nitriteMapRegistry.remove(mapName);
+        }
+    }
+
+    @Override
+    public void closeRTree(String rTreeName) {
+        if (!StringUtils.isNullOrEmpty(rTreeName)) {
+            nitriteRTreeMapRegistry.remove(rTreeName);
+        }
+    }
+
+    @Override
+    public void removeMap(String name) {
+        if (StringUtils.isNullOrEmpty(name)) {
+            return;
+        }
+        // a map another thread has already removed is simply gone; openMVMap would create an
+        // empty map of that name only to remove it again
+        if (mvStore.hasMap(name)) {
+            MVMap<?, ?> mvMap = openMVMap(name, null);
+            mvStore.removeMap(mvMap);
+        }
+        getCatalog().remove(name);
+        nitriteMapRegistry.remove(name);
+    }
+
+    @Override
+    @SuppressWarnings({"rawtypes"})
+    public void removeRTree(String rTreeName) {
+        MVMap mvMap = openMVMap(rTreeName, new MVRTreeMap.Builder<>());
+        mvStore.removeMap(mvMap);
+        getCatalog().remove(rTreeName);
+        nitriteRTreeMapRegistry.remove(rTreeName);
+    }
+
+    @Override
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public <Key extends BoundingBox, Value> NitriteRTree<Key, Value> openRTree(String mapName, Class<?> keyType, Class<?> valueType) {
+        return (NitriteMVRTreeMap) nitriteRTreeMapRegistry.computeIfAbsent(mapName, name -> {
+            MVRTreeMap<Value> map = (MVRTreeMap<Value>) openMVMap(name, new MVRTreeMap.Builder<>());
+            return new NitriteMVRTreeMap(map, this);
+        });
+    }
+
+    @Override
+    public String getStoreVersion() {
+        return "MVStore/" + org.h2.engine.Constants.VERSION;
+    }
+
+    /**
+     * Closes the store with a full compaction, single-threaded.
+     *
+     * <p>MVStore reads <code>h2.compactThreads</code> on each compacting close, defaulting to a
+     * quarter of the available processors, and parallel compaction races on page references in
+     * 2.4.240 - see <a href="https://github.com/h2database/h2database/issues/4286">h2#4286</a>.
+     * Pinning the property to 1 for the duration of the close is the upstream workaround; the
+     * lock is what keeps two concurrent closes from restoring each other's value. Both can go
+     * once the fix ships.
+     *
+     * <p>The lock is deliberately private rather than the <code>Properties</code> instance
+     * itself: <code>Properties</code> is a <code>Hashtable</code>, so holding its monitor across
+     * a compaction would stall every <code>System.getProperty</code> call in the JVM for as long
+     * as the compaction runs.
+     */
+    private void compactAndClose() {
+        synchronized (COMPACT_THREADS_LOCK) {
+            final String originalCompactThreads = System.getProperty(COMPACT_THREADS_PROPERTY);
+            try {
+                System.setProperty(COMPACT_THREADS_PROPERTY, "1");
+                mvStore.close(-1);
+            } finally {
+                if (originalCompactThreads == null) {
+                    System.clearProperty(COMPACT_THREADS_PROPERTY);
+                } else {
+                    System.setProperty(COMPACT_THREADS_PROPERTY, originalCompactThreads);
+                }
+            }
+        }
+    }
+
+    private void initEventBus() {
+        if (getStoreConfig().eventListeners() != null) {
+            for (StoreEventListener eventListener : getStoreConfig().eventListeners()) {
+                eventBus.register(eventListener);
+            }
+        }
+    }
+
+    /**
+     * Settles an {@link ObjectDataType} key type on its serialized-object delegate while one
+     * thread holds the map ({@code openMap} runs inside {@code computeIfAbsent}).
+     *
+     * <p>H2 picks that delegate on first use through an unsynchronized field, and
+     * {@code SerializedObjectType.compare} checks delegates by identity, so threads making a
+     * map's first key comparison at once can each install their own and fail with
+     * {@code UnsupportedOperationException: Can not compare}. A file-backed map is settled
+     * already, by reading its root page at open or estimating the memory of a write; an
+     * in-memory store does neither. Every Nitrite map with {@code ObjectDataType} keys holds
+     * serialized objects or strings, and a string map switches back on its first key through
+     * a singleton delegate that compares without the identity check. Nothing is serialized.
+     * The same code is in h2 2.4.240 and 2.5.250; drop this once H2 fixes it.
+     */
+    private static void settleKeyType(DataType<?> keyType) {
+        if (keyType instanceof ObjectDataType) {
+            ((ObjectDataType) keyType).getMemory(SERIALIZED_KEY_SAMPLE);
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private MVMap openMVMap(String mapName, MVMap.MapBuilder builder) {
+        Exception exception = null;
+        try {
+            MVMap.MapBuilder mapBuilder = builder == null ? new MVMap.Builder<>() : builder;
+            long version = mvStore.getCurrentVersion();
+
+            while (version >= 0) {
+                try {
+                    MVMap map = mvStore.openMap(mapName, mapBuilder);
+                    settleKeyType(map.getKeyType());
+                    enableAutoCommitIfPending();
+                    return map;
+                } catch (MVStoreException me) {
+                    if (version == 0) {
+                        throw me;
+                    }
+
+                    log.warn("Error opening map {} with version {}, retrying with previous version", mapName, version, me);
+                    if (me.getErrorCode() == ERROR_READING_FAILED || me.getErrorCode() == ERROR_WRITING_FAILED
+                        || me.getErrorCode() == ERROR_FILE_CORRUPT || me.getErrorCode() == ERROR_SERIALIZATION
+                        || me.getErrorCode() == ERROR_CHUNK_NOT_FOUND || me.getErrorCode() == ERROR_BLOCK_NOT_FOUND) {
+                        // open map with earlier version
+                        mvStore.rollbackTo(version - 1);
+                        version = mvStore.getCurrentVersion();
+                    } else {
+                        throw me;
+                    }
+                    exception = me;
+                }
+            }
+        } catch (Exception e) {
+            exception = e;
+        }
+
+        throw new NitriteIOException("Unable to open map " + mapName, exception);
+    }
+}

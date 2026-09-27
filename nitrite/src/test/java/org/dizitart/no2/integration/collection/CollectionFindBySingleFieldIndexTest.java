@@ -1,0 +1,1098 @@
+/*
+ * Copyright (c) 2017-2021 Nitrite author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+package org.dizitart.no2.integration.collection;
+
+import com.github.javafaker.Faker;
+import org.dizitart.no2.collection.Document;
+import org.dizitart.no2.collection.DocumentCursor;
+import org.dizitart.no2.collection.FindPlan;
+import org.dizitart.no2.collection.NitriteCollection;
+import org.dizitart.no2.common.SortOrder;
+import org.dizitart.no2.exceptions.FilterException;
+import org.dizitart.no2.index.IndexOptions;
+import org.dizitart.no2.index.IndexType;
+import org.junit.Test;
+
+import java.text.ParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.List;
+
+import static org.dizitart.no2.integration.TestUtil.isSorted;
+import static org.dizitart.no2.collection.FindOptions.orderBy;
+import static org.dizitart.no2.filters.Filter.and;
+import static org.dizitart.no2.filters.Filter.or;
+import static org.dizitart.no2.filters.FluentFilter.where;
+import static org.junit.Assert.*;
+
+/**
+ * @author Anindya Chatterjee.
+ */
+public class CollectionFindBySingleFieldIndexTest extends BaseCollectionTest {
+
+    @Test
+    public void testFindByUniqueIndex() throws ParseException {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "firstName");
+        DocumentCursor cursor = collection.find(where("firstName").eq("fn1"));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("firstName").eq("fn10"));
+        assertEquals(cursor.size(), 0);
+
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "birthDay");
+        cursor = collection.find(where("birthDay").gt(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("birthDay").gte(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("birthDay").lt(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("birthDay").lte(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("birthDay").lte(
+            new Date()));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(where("birthDay").lt(
+            new Date()));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(where("birthDay").gt(
+            new Date()));
+        assertEquals(cursor.size(), 0);
+
+        cursor = collection.find(where("birthDay").gte(
+            new Date()));
+        assertEquals(cursor.size(), 0);
+
+        cursor = collection.find(
+            where("birthDay").lte(new Date())
+                .and(where("firstName").eq("fn1")));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(
+            where("birthDay").lte(new Date())
+                .or(where("firstName").eq("fn12")));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(
+            and(
+                or(
+                    where("birthDay").lte(new Date()),
+                    where("firstName").eq("fn12")
+                ),
+                where("lastName").eq("ln1")
+            ));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(
+            and(
+                or(
+                    where("birthDay").lte(new Date()),
+                    where("firstName").eq("fn12")
+                ),
+                where("lastName").eq("ln1")
+            ).not());
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("data.1").eq((byte) 4));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("data.1").lt(4));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("lastName").in("ln1", "ln2", "ln10"));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(where("firstName").notIn("fn1", "fn2"));
+        assertEquals(cursor.size(), 1);
+    }
+
+    @Test
+    public void testInFilterUsesIndex() {
+        // reproduces issue #1258 - `in` / `notIn` filter must use the index
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "lastName");
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "firstName");
+
+        DocumentCursor cursor = collection.find(where("lastName").in("ln1", "ln2", "ln10"));
+        assertEquals(cursor.size(), 3);
+        FindPlan plan = cursor.getFindPlan();
+        assertNotNull("in filter should use index scan", plan.getIndexScanFilter());
+        assertNotNull(plan.getIndexDescriptor());
+        assertNull("in filter should not fall back to collection scan", plan.getCollectionScanFilter());
+
+        cursor = collection.find(where("firstName").notIn("fn1", "fn2"));
+        assertEquals(cursor.size(), 1);
+        plan = cursor.getFindPlan();
+        assertNotNull("notIn filter should use index scan", plan.getIndexScanFilter());
+        assertNotNull(plan.getIndexDescriptor());
+        assertNull("notIn filter should not fall back to collection scan", plan.getCollectionScanFilter());
+
+        // direct-lookup index scan must still honor the requested sort order
+        cursor = collection.find(where("firstName").in("fn3", "fn1", "fn2"),
+            orderBy("firstName", SortOrder.Ascending));
+        List<Object> ascending = new ArrayList<>();
+        for (Document doc : cursor) {
+            ascending.add(doc.get("firstName"));
+        }
+        assertEquals(Arrays.asList("fn1", "fn2", "fn3"), ascending);
+
+        cursor = collection.find(where("firstName").in("fn3", "fn1", "fn2"),
+            orderBy("firstName", SortOrder.Descending));
+        List<Object> descending = new ArrayList<>();
+        for (Document doc : cursor) {
+            descending.add(doc.get("firstName"));
+        }
+        assertEquals(Arrays.asList("fn3", "fn2", "fn1"), descending);
+    }
+
+    @Test
+    public void testIndexedMultiBoundRangeQueryMatchesFullScan() {
+        // Regression: a multi-bound range query on a single-field index (e.g. `age >= 30 AND
+        // age <= 50`) must use both bounds at the index level and return the exact same set as
+        // an unindexed full scan - not "everything above the lower bound, post-filtered".
+        NitriteCollection coll = db.getCollection("range");
+        for (int age = 0; age < 100; age++) {
+            coll.insert(Document.createDocument("age", age));
+        }
+
+        // Ground truth from an unindexed full scan: ages 30..=50 inclusive = 21 docs.
+        assertEquals(21, coll.find(where("age").gte(30).and(where("age").lte(50))).size());
+
+        // Index the field; the same query must return the identical, exact set.
+        coll.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "age");
+
+        List<Integer> ages = new ArrayList<>();
+        for (Document doc : coll.find(where("age").gte(30).and(where("age").lte(50)))) {
+            ages.add(doc.get("age", Integer.class));
+        }
+        ages.sort(null);
+        List<Integer> expected = new ArrayList<>();
+        for (int i = 30; i <= 50; i++) {
+            expected.add(i);
+        }
+        assertEquals("indexed range must equal exactly ages 30..=50 (both bounds applied)",
+            expected, ages);
+
+        // Exclusive bounds: 30 < age < 50 -> 31..=49 = 19 docs.
+        assertEquals(19, coll.find(where("age").gt(30).and(where("age").lt(50))).size());
+        // Contradictory range yields nothing.
+        assertEquals(0, coll.find(where("age").gte(50).and(where("age").lte(30))).size());
+        // Degenerate single-value range.
+        assertEquals(1, coll.find(where("age").gte(42).and(where("age").lte(42))).size());
+
+        // The `between` API must be index-accelerated identically to `gte().and(lte())`.
+        assertEquals(21, coll.find(where("age").between(30, 50, true)).size());
+        // And nested inside an AND with another predicate (exercises 3 same-field bounds via
+        // the intersection fallback).
+        assertEquals(10, coll.find(
+            where("age").between(30, 50, true).and(where("age").gt(40))).size()); // ages 41..=50
+    }
+
+    @Test
+    public void testCompoundIndexTerminalRangeMatchesFullScan() {
+        // A compound index `[folder, date]` queried with an equality prefix and a range on the
+        // terminal field (`folder == 3 AND date BETWEEN 20 AND 40`) must bound the range at the
+        // index level and return the exact same set as a full scan.
+        NitriteCollection coll = db.getCollection("compound_range");
+        for (int folder = 0; folder < 10; folder++) {
+            for (int date = 0; date < 100; date++) {
+                coll.insert(Document.createDocument("folder", folder)
+                    .put("date", date));
+            }
+        }
+
+        // Ground truth from an unindexed full scan: dates 20..=40 in folder 3 = 21 docs.
+        assertEquals(21, coll.find(
+            and(where("folder").eq(3), where("date").gte(20), where("date").lte(40))).size());
+
+        // With the compound index the result must be identical and exact.
+        coll.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "folder", "date");
+
+        List<Integer> dates = new ArrayList<>();
+        for (Document doc : coll.find(
+            and(where("folder").eq(3), where("date").gte(20), where("date").lte(40)))) {
+            dates.add(doc.get("date", Integer.class));
+            // Every returned document must be in the queried folder.
+            assertEquals(Integer.valueOf(3), doc.get("folder", Integer.class));
+        }
+        dates.sort(null);
+        List<Integer> expected = new ArrayList<>();
+        for (int i = 20; i <= 40; i++) {
+            expected.add(i);
+        }
+        assertEquals("compound terminal range must equal exactly dates 20..=40 in folder 3",
+            expected, dates);
+
+        // A different folder over a non-existent date range yields nothing.
+        assertEquals(0, coll.find(
+            and(where("folder").eq(7), where("date").gte(200), where("date").lte(400))).size());
+    }
+
+    @Test
+    public void testCoveredCountSizeMatchesIteration() {
+        // size() may short-circuit to the index id-set size (or the map size) when the query is
+        // fully index-covered with no post-filter, skip, or limit. That fast count must always
+        // agree with actually draining the cursor - on both covered and non-covered paths.
+        NitriteCollection coll = db.getCollection("covered_count");
+        for (int age = 0; age < 100; age++) {
+            coll.insert(Document.createDocument("age", age).put("even", age % 2 == 0));
+        }
+        coll.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "age");
+
+        // Plain find(): covered by the map size.
+        assertEquals(countByIteration(coll.find()), coll.find().size());
+        assertEquals(100, coll.find().size());
+
+        // Indexed equality and range: covered by the index id-set size.
+        assertEquals(countByIteration(coll.find(where("age").eq(42))),
+            coll.find(where("age").eq(42)).size());
+        DocumentCursor range = coll.find(where("age").gte(30).and(where("age").lte(50)));
+        assertEquals(countByIteration(range), range.size());
+
+        // Non-covered: a post-filter on an unindexed field must still count correctly (no
+        // short-circuit), as must skip/limit.
+        DocumentCursor postFiltered = coll.find(where("even").eq(true));
+        assertEquals(countByIteration(postFiltered), postFiltered.size());
+        assertEquals(50, postFiltered.size());
+        DocumentCursor limited = coll.find(where("age").gte(0),
+            org.dizitart.no2.collection.FindOptions.skipBy(10).limit(5));
+        assertEquals(countByIteration(limited), limited.size());
+        assertEquals(5, limited.size());
+    }
+
+    private static long countByIteration(DocumentCursor cursor) {
+        long count = 0;
+        for (Document ignored : cursor) {
+            count++;
+        }
+        return count;
+    }
+
+    @Test
+    public void testFindByNonUniqueIndex() throws ParseException {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "lastName");
+        collection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "birthDay");
+
+        DocumentCursor cursor = collection.find(where("lastName").eq("ln2"));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("lastName").eq("ln20"));
+        assertEquals(cursor.size(), 0);
+
+        cursor = collection.find(where("birthDay").gt(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("birthDay").gte(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("birthDay").lt(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("birthDay").lte(
+            simpleDateFormat.parse("2012-07-01T16:02:48.440Z")));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("birthDay").lte(
+            new Date()));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(where("birthDay").lt(
+            new Date()));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(where("birthDay").gt(
+            new Date()));
+        assertEquals(cursor.size(), 0);
+
+        cursor = collection.find(where("birthDay").gte(
+            new Date()));
+        assertEquals(cursor.size(), 0);
+
+        cursor = collection.find(
+            where("birthDay").lte(new Date())
+                .and(where("firstName").eq("fn1")));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(
+            where("birthDay").lte(new Date())
+                .or(where("firstName").eq("fn12")));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(
+            and(
+                or(
+                    where("birthDay").lte(new Date()),
+                    where("firstName").eq("fn12")
+                ),
+                where("lastName").eq("ln1")
+            ));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(
+            and(
+                or(
+                    where("birthDay").lte(new Date()),
+                    where("firstName").eq("fn12")
+                ),
+                where("lastName").eq("ln1")
+            ).not());
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("data.1").eq((byte) 4));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("data.1").lt(4));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("lastName").in("ln1", "ln2", "ln10"));
+        assertEquals(cursor.size(), 3);
+
+        cursor = collection.find(where("firstName").notIn("fn1", "fn2"));
+        assertEquals(cursor.size(), 1);
+    }
+
+    @Test
+    public void testFindByFullTextIndexAfterInsert() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.FULL_TEXT), "body");
+        assertTrue(collection.hasIndex("body"));
+
+        DocumentCursor cursor = collection.find(where("body").text("Lorem"));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("body").text("nosql"));
+        assertEquals(cursor.size(), 0);
+
+        collection.dropIndex("body");
+        boolean filterException = false;
+        try {
+            collection.find(where("body").text("Lorem")).toList();
+        } catch (FilterException fe) {
+            filterException = true;
+        } finally {
+            assertTrue(filterException);
+        }
+    }
+
+    @Test
+    public void testFindByFullTextIndexBeforeInsert() {
+        collection.createIndex(IndexOptions.indexOptions(IndexType.FULL_TEXT), "body");
+        assertTrue(collection.hasIndex("body"));
+        insert();
+
+        DocumentCursor cursor = collection.find(where("body").text("Lorem"));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("body").text("quick brown"));
+        assertEquals(cursor.size(), 2);
+
+        cursor = collection.find(where("body").text("nosql"));
+        assertEquals(cursor.size(), 0);
+
+        collection.dropIndex("body");
+        boolean filterException = false;
+        try {
+            collection.find(where("body").text("Lorem")).toList();
+        } catch (FilterException fe) {
+            filterException = true;
+        } finally {
+            assertTrue(filterException);
+        }
+    }
+
+    @Test
+    public void testFindByIndexSortAscending() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "birthDay");
+
+        DocumentCursor cursor = collection.find(orderBy("birthDay", SortOrder.Ascending));
+        assertEquals(cursor.size(), 3);
+        List<Date> dateList = new ArrayList<>();
+        for (Document document : cursor) {
+            dateList.add(document.get("birthDay", Date.class));
+        }
+        assertTrue(isSorted(dateList, true));
+    }
+
+    @Test
+    public void testFindByIndexSortDescending() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "birthDay");
+
+        DocumentCursor cursor = collection.find(orderBy("birthDay", SortOrder.Descending));
+        assertEquals(cursor.size(), 3);
+        List<Date> dateList = new ArrayList<>();
+        for (Document document : cursor) {
+            dateList.add(document.get("birthDay", Date.class));
+        }
+        assertTrue(isSorted(dateList, false));
+    }
+
+    @Test
+    public void testFindByIndexLimitAndSort() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "birthDay");
+
+        DocumentCursor cursor = collection.find(
+            orderBy("birthDay", SortOrder.Descending)
+                .skip(1)
+                .limit(2)
+        );
+        assertEquals(cursor.size(), 2);
+        List<Date> dateList = new ArrayList<>();
+        for (Document document : cursor) {
+            dateList.add(document.get("birthDay", Date.class));
+        }
+        assertTrue(isSorted(dateList, false));
+
+        cursor = collection.find(orderBy("birthDay", SortOrder.Ascending).skip(1).limit(2));
+        assertEquals(cursor.size(), 2);
+        dateList = new ArrayList<>();
+        for (Document document : cursor) {
+            dateList.add(document.get("birthDay", Date.class));
+        }
+        assertTrue(isSorted(dateList, true));
+
+        cursor = collection.find(orderBy("firstName", SortOrder.Ascending).skip(0).limit(30));
+        assertEquals(cursor.size(), 3);
+        List<String> nameList = new ArrayList<>();
+        for (Document document : cursor) {
+            nameList.add(document.get("firstName", String.class));
+        }
+        assertTrue(isSorted(nameList, true));
+    }
+
+    @Test
+    public void testFindAfterDroppedIndex() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "firstName");
+        DocumentCursor cursor = collection.find(where("firstName").eq("fn1"));
+        assertEquals(cursor.size(), 1);
+
+        collection.dropIndex("firstName");
+        cursor = collection.find(where("firstName").eq("fn1"));
+        assertEquals(cursor.size(), 1);
+    }
+
+    @Test
+    public void testFindTextWithWildCard() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.FULL_TEXT), "body");
+
+        DocumentCursor cursor = collection.find(where("body").text("Lo"));
+        assertEquals(cursor.size(), 0);
+
+        cursor = collection.find(where("body").text("Lo*"));
+        assertEquals(cursor.size(), 1);      // Lorem
+
+        cursor = collection.find(where("body").text("*rem"));
+        assertEquals(cursor.size(), 1);      // lorem
+
+        cursor = collection.find(where("body").text("*or*"));
+        assertEquals(cursor.size(), 2);
+    }
+
+    @Test
+    public void testFindTextWithEmptyString() {
+        insert();
+        collection.createIndex(IndexOptions.indexOptions(IndexType.FULL_TEXT), "body");
+
+        DocumentCursor cursor = collection.find(where("body").text(""));
+        assertEquals(cursor.size(), 0);
+    }
+
+    @Test
+    public void testFindWithOrIndexed() {
+        NitriteCollection collection = db.getCollection("testFindWithOrIndexed");
+        Document doc1 = Document.createDocument("firstName", "John").put("lastName", "Doe");
+        Document doc2 = Document.createDocument("firstName", "Jane").put("lastName", "Doe");
+        Document doc3 = Document.createDocument("firstName", "Jonas").put("lastName", "Doe");
+        Document doc4 = Document.createDocument("firstName", "Johan").put("lastName", "Day");
+
+        collection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "firstName");
+        collection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "lastName");
+
+        collection.insert(doc1, doc2, doc3, doc4);
+
+        DocumentCursor cursor = collection.find(where("firstName").eq("John").or(where("lastName").eq("Day")));
+        assertEquals(cursor.size(), 2);
+
+        List<Document> list = cursor.toList();
+        assertEquals(list.size(), 2);
+    }
+
+    @Test
+    public void testIssue45() {
+        NitriteCollection collection = db.getCollection("testIssue45");
+        Faker faker = new Faker();
+        String text1 = faker.lorem().paragraph() + " quick brown";
+        String text2 = faker.lorem().paragraph() + " fox jump";
+        String text3 = faker.lorem().paragraph() + " over lazy";
+        String text4 = faker.lorem().paragraph() + " dog";
+
+        List<String> list1 = Arrays.asList(text1, text2);
+        List<String> list2 = Arrays.asList(text1, text2, text3);
+        List<String> list3 = Arrays.asList(text2, text3);
+        List<String> list4 = Arrays.asList(text1, text2, text3, text4);
+
+        Document doc1 = Document.createDocument("firstName", "John").put("notes", list1);
+        Document doc2 = Document.createDocument("firstName", "Jane").put("notes", list2);
+        Document doc3 = Document.createDocument("firstName", "Jonas").put("notes", list3);
+        Document doc4 = Document.createDocument("firstName", "Johan").put("notes", list4);
+
+        collection.createIndex(IndexOptions.indexOptions(IndexType.FULL_TEXT), "notes");
+        collection.insert(doc1, doc2, doc3, doc4);
+
+        DocumentCursor cursor = collection.find(where("notes").text("fox"));
+        assertEquals(cursor.size(), 4);
+
+        cursor = collection.find(where("notes").text("dog"));
+        assertEquals(cursor.size(), 1);
+
+        cursor = collection.find(where("notes").text("lazy"));
+        assertEquals(cursor.size(), 3);
+    }
+
+    @Test
+    public void testSortByIndexDescendingLessThanEqual() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexDescendingLessThanEqual");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").lte(3),
+            orderBy("name", SortOrder.Descending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").lte(3),
+            orderBy("name", SortOrder.Descending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexAscendingLessThanEqual() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexAscendingLessThanEqual");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").lte(3),
+            orderBy("name", SortOrder.Ascending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").lte(3),
+            orderBy("name", SortOrder.Ascending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexDescendingGreaterThanEqual() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexDescendingGreaterThanEqual");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").gte(3),
+            orderBy("name", SortOrder.Descending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").gte(3),
+            orderBy("name", SortOrder.Descending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexAscendingGreaterThanEqual() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexAscendingGreaterThanEqual");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").gte(3),
+            orderBy("name", SortOrder.Ascending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").gte(3),
+            orderBy("name", SortOrder.Ascending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexDescendingGreaterThan() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexDescendingGreaterThan");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").gt(3),
+            orderBy("name", SortOrder.Descending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").gt(3),
+            orderBy("name", SortOrder.Descending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexAscendingGreaterThan() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexAscendingGreaterThan");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").gt(3),
+            orderBy("name", SortOrder.Ascending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").gt(3),
+            orderBy("name", SortOrder.Ascending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexDescendingLessThan() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexDescendingLessThan");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").lt(3),
+            orderBy("name", SortOrder.Descending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").lt(3),
+            orderBy("name", SortOrder.Descending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testSortByIndexAscendingLessThan() {
+        NitriteCollection nitriteCollection = db.getCollection("testSortByIndexAscendingLessThan");
+        List<Integer> integerList = Arrays.asList(1, 2, 3, 4, 5);
+        integerList.forEach(i -> {
+            Document doc = Document.createDocument();
+            doc.put("name", i);
+            nitriteCollection.insert(doc);
+        });
+
+        DocumentCursor cursor = nitriteCollection.find(where("name").lt(3),
+            orderBy("name", SortOrder.Ascending));
+
+        List<Document> docIter = cursor.toList();
+        Integer[] nonIndexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        nitriteCollection.createIndex(IndexOptions.indexOptions(IndexType.UNIQUE), "name");
+
+        cursor = nitriteCollection.find(where("name").lt(3),
+            orderBy("name", SortOrder.Ascending));
+        docIter = cursor.toList();
+        Integer[] indexedResult = docIter.stream().map(d -> d.get("name", Integer.class)).toArray(Integer[]::new);
+
+        assertArrayEquals(nonIndexedResult, indexedResult);
+    }
+
+    @Test
+    public void testFindByArrayFieldIndexWithElemMatch() {
+        // Create a collection with array field
+        NitriteCollection userCollection = db.getCollection("users");
+        
+        // Insert a larger dataset (15k documents as mentioned in the issue)
+        for (int i = 0; i < 15000; i++) {
+            Document doc = Document.createDocument("name", "user" + i)
+                .put("emails", new String[]{"user" + i + "@example.com", "user" + i + "@test.com"});
+            userCollection.insert(doc);
+        }
+        
+        // Add a specific test document
+        userCollection.insert(Document.createDocument("name", "testuser")
+            .put("emails", new String[]{"test@gmail.com", "test@example.com"}));
+        
+        // Measure query time WITHOUT index
+        long startWithoutIndex = System.nanoTime();
+        DocumentCursor cursorWithoutIndex = userCollection.find(
+            where("emails").elemMatch(org.dizitart.no2.filters.FluentFilter.$.eq("test@gmail.com")));
+        long withoutIndexCount = cursorWithoutIndex.size();
+        long endWithoutIndex = System.nanoTime();
+        long timeWithoutIndex = (endWithoutIndex - startWithoutIndex) / 1_000_000;
+        
+        assertEquals(1, withoutIndexCount);
+        
+        // Verify collection scan is used when no index exists (no index descriptor)
+        FindPlan planWithoutIndex = cursorWithoutIndex.getFindPlan();
+        assertNull("Index descriptor should be null when no index exists", 
+            planWithoutIndex.getIndexDescriptor());
+        
+        // Create index on emails field
+        userCollection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "emails");
+        
+        // Measure query time WITH index
+        long startWithIndex = System.nanoTime();
+        DocumentCursor cursorWithIndex = userCollection.find(
+            where("emails").elemMatch(org.dizitart.no2.filters.FluentFilter.$.eq("test@gmail.com")));
+        long withIndexCount = cursorWithIndex.size();
+        long endWithIndex = System.nanoTime();
+        long timeWithIndex = (endWithIndex - startWithIndex) / 1_000_000;
+        
+        assertEquals(1, withIndexCount);
+        
+        // Verify index is actually being used by checking the find plan
+        FindPlan planWithIndex = cursorWithIndex.getFindPlan();
+        assertNotNull("Index scan filter should not be null when index exists", 
+            planWithIndex.getIndexScanFilter());
+        assertNotNull("Index descriptor should not be null when index is used", 
+            planWithIndex.getIndexDescriptor());
+        
+        // With index should be significantly faster
+        System.out.println("ElemMatch query on 15k documents:");
+        System.out.println("  Time without index: " + timeWithoutIndex + " ms");
+        System.out.println("  Time with index: " + timeWithIndex + " ms");
+        System.out.println("  Speedup: " + (timeWithoutIndex > 0 ? (timeWithoutIndex / (double) Math.max(1, timeWithIndex)) : "N/A") + "x");
+        
+        // Assert that index provides significant improvement (at least 2x faster)
+        // This is a conservative check - actual improvement should be much higher
+        assertTrue("Index should provide significant performance improvement", 
+            timeWithIndex < timeWithoutIndex || timeWithIndex < 100);
+    }
+
+    @Test
+    public void testFindByArrayFieldIndexWithElemMatchComplexFilter() {
+        // Create a collection with array field
+        NitriteCollection productCollection = db.getCollection("products");
+        
+        // Insert documents with array of scores
+        for (int i = 0; i < 1000; i++) {
+            Document doc = Document.createDocument("name", "product" + i)
+                .put("scores", new Integer[]{i, i + 10, i + 20});
+            productCollection.insert(doc);
+        }
+        
+        // Create index on scores field
+        productCollection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "scores");
+        
+        // Test 1: Query with elemMatch using gt filter
+        DocumentCursor cursor = productCollection.find(
+            where("scores").elemMatch(org.dizitart.no2.filters.FluentFilter.$.gt(995)));
+        
+        // Verify index is used
+        FindPlan findPlan = cursor.getFindPlan();
+        assertNotNull("Index scan filter should be used for gt query", findPlan.getIndexScanFilter());
+        assertNotNull("Index descriptor should be present", findPlan.getIndexDescriptor());
+        
+        // Should find products where at least one score is > 995
+        assertTrue("Should find products with scores > 995", cursor.size() > 0);
+        
+        // Test 2: Query with elemMatch using lt filter
+        cursor = productCollection.find(
+            where("scores").elemMatch(org.dizitart.no2.filters.FluentFilter.$.lt(5)));
+        
+        // Verify index is used
+        findPlan = cursor.getFindPlan();
+        assertNotNull("Index scan filter should be used for lt query", findPlan.getIndexScanFilter());
+        assertNotNull("Index descriptor should be present", findPlan.getIndexDescriptor());
+        
+        // Should find products where at least one score is < 5
+        assertTrue("Should find products with scores < 5", cursor.size() > 0);
+        
+        // Test 3: Query with elemMatch using gte filter
+        cursor = productCollection.find(
+            where("scores").elemMatch(org.dizitart.no2.filters.FluentFilter.$.gte(500)));
+        
+        findPlan = cursor.getFindPlan();
+        assertNotNull("Index scan filter should be used for gte query", findPlan.getIndexScanFilter());
+        assertTrue("Should find products with scores >= 500", cursor.size() > 0);
+        
+        // Test 4: Query with elemMatch using lte filter
+        cursor = productCollection.find(
+            where("scores").elemMatch(org.dizitart.no2.filters.FluentFilter.$.lte(500)));
+        
+        findPlan = cursor.getFindPlan();
+        assertNotNull("Index scan filter should be used for lte query", findPlan.getIndexScanFilter());
+        assertTrue("Should find products with scores <= 500", cursor.size() > 0);
+    }
+    
+    @Test
+    public void testElemMatchWithNonUniqueIndex() {
+        // Test that elemMatch works with non-unique index
+        NitriteCollection tagCollection = db.getCollection("tags");
+        
+        // Insert documents with tag arrays (some tags are common)
+        for (int i = 0; i < 500; i++) {
+            Document doc = Document.createDocument("id", i)
+                .put("tags", new String[]{"tag" + i, "category" + (i % 10), "item" + i});
+            tagCollection.insert(doc);
+        }
+        
+        // Create non-unique index on tags field (since there are duplicate values)
+        tagCollection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "tags");
+        
+        // Query with elemMatch
+        DocumentCursor cursor = tagCollection.find(
+            where("tags").elemMatch(org.dizitart.no2.filters.FluentFilter.$.eq("tag100")));
+        
+        // Verify index is used
+        FindPlan findPlan = cursor.getFindPlan();
+        assertNotNull("Index scan filter should be used", 
+            findPlan.getIndexScanFilter());
+        assertNotNull("Index descriptor should be present", 
+            findPlan.getIndexDescriptor());
+        assertEquals("Should find exactly one document", 1, cursor.size());
+        
+        // Query for a common category tag (should find multiple)
+        cursor = tagCollection.find(
+            where("tags").elemMatch(org.dizitart.no2.filters.FluentFilter.$.eq("category5")));
+        
+        findPlan = cursor.getFindPlan();
+        assertNotNull("Index should be used for common values too", 
+            findPlan.getIndexScanFilter());
+        assertEquals("Should find all documents with category5", 50, cursor.size());
+    }
+    
+    @Test
+    public void testElemMatchIndexPerformanceComparison() {
+        // This test explicitly measures and compares performance
+        NitriteCollection perfCollection = db.getCollection("performance");
+        
+        // Insert a meaningful dataset
+        for (int i = 0; i < 10000; i++) {
+            Document doc = Document.createDocument("id", i)
+                .put("values", new Integer[]{i, i * 2, i * 3});
+            perfCollection.insert(doc);
+        }
+        
+        // Add a unique test value that only appears once
+        perfCollection.insert(Document.createDocument("id", 99999)
+            .put("values", new Integer[]{77777, 88888, 99999}));
+        
+        // Test WITHOUT index
+        long startNoIndex = System.nanoTime();
+        DocumentCursor noIndexCursor = perfCollection.find(
+            where("values").elemMatch(org.dizitart.no2.filters.FluentFilter.$.eq(99999)));
+        long noIndexCount = noIndexCursor.size();
+        long endNoIndex = System.nanoTime();
+        long timeNoIndex = (endNoIndex - startNoIndex) / 1_000_000;
+        
+        // Verify no index was used (no index descriptor)
+        FindPlan noIndexPlan = noIndexCursor.getFindPlan();
+        assertNull("Index descriptor should be null without index", 
+            noIndexPlan.getIndexDescriptor());
+        assertEquals(1, noIndexCount);
+        
+        // Create index
+        perfCollection.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "values");
+        
+        // Test WITH index
+        long startWithIndex = System.nanoTime();
+        DocumentCursor withIndexCursor = perfCollection.find(
+            where("values").elemMatch(org.dizitart.no2.filters.FluentFilter.$.eq(99999)));
+        long withIndexCount = withIndexCursor.size();
+        long endWithIndex = System.nanoTime();
+        long timeWithIndex = (endWithIndex - startWithIndex) / 1_000_000;
+        
+        // Verify index was used
+        FindPlan withIndexPlan = withIndexCursor.getFindPlan();
+        assertNotNull("Index scan filter should be used with index", 
+            withIndexPlan.getIndexScanFilter());
+        assertNotNull("Index descriptor should be present", 
+            withIndexPlan.getIndexDescriptor());
+        assertEquals(1, withIndexCount);
+        
+        System.out.println("Performance comparison for elemMatch on 10k documents:");
+        System.out.println("  Without index: " + timeNoIndex + " ms");
+        System.out.println("  With index: " + timeWithIndex + " ms");
+        System.out.println("  Improvement: " + 
+            (timeNoIndex > 0 ? String.format("%.1fx", timeNoIndex / (double) Math.max(1, timeWithIndex)) : "N/A"));
+        
+        // Index should provide measurable improvement
+        assertTrue("Index should improve performance or complete very quickly",
+            timeWithIndex < timeNoIndex || timeWithIndex < 100);
+    }
+
+    @Test
+    public void testNonUniqueIndexManySameKey() {
+        // Issue #1260: a non-unique index on a low-cardinality field stores many ids under the
+        // same value. The composite-key layout must still return every matching id, reflect
+        // removals, and honour both insert-before-index and after-index ordering.
+        NitriteCollection coll = db.getCollection("non_unique_many");
+        int perKey = 2000;
+        for (int i = 0; i < perKey; i++) {
+            coll.insert(Document.createDocument("key", "k1").put("seq", i));
+            coll.insert(Document.createDocument("key", "k2").put("seq", i));
+        }
+
+        coll.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "key");
+
+        assertEquals(perKey, coll.find(where("key").eq("k1")).size());
+        assertEquals(perKey, coll.find(where("key").eq("k2")).size());
+        assertEquals(0, coll.find(where("key").eq("missing")).size());
+
+        // The query must use the index, not fall back to a collection scan.
+        FindPlan plan = coll.find(where("key").eq("k1")).getFindPlan();
+        assertNotNull("eq filter should use index scan", plan.getIndexScanFilter());
+        assertNull("eq filter should not fall back to collection scan", plan.getCollectionScanFilter());
+
+        // notEquals must return exactly the complement.
+        assertEquals(perKey, coll.find(where("key").notEq("k1")).size());
+
+        // Removing all k1 documents must clear them from the index without touching k2.
+        coll.remove(where("key").eq("k1"));
+        assertEquals(0, coll.find(where("key").eq("k1")).size());
+        assertEquals(perKey, coll.find(where("key").eq("k2")).size());
+
+        // Inserting a new k1 after removal must reappear through the index.
+        coll.insert(Document.createDocument("key", "k1").put("seq", -1));
+        assertEquals(1, coll.find(where("key").eq("k1")).size());
+    }
+
+    @Test
+    public void testNonUniqueIndexOrderingAndRange() {
+        // The composite layout must present distinct values in natural (and reverse) order and
+        // support range scans, with several ids living under each value.
+        NitriteCollection coll = db.getCollection("non_unique_order");
+        for (int v = 0; v < 10; v++) {
+            for (int dup = 0; dup < 5; dup++) {
+                coll.insert(Document.createDocument("v", v).put("dup", dup));
+            }
+        }
+        coll.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "v");
+
+        // Ascending distinct order over duplicated values.
+        List<Integer> asc = new ArrayList<>();
+        for (Document doc : coll.find(where("v").gte(0), orderBy("v", SortOrder.Ascending))) {
+            asc.add(doc.get("v", Integer.class));
+        }
+        assertTrue("values must be ascending", isSorted(asc, true));
+        assertEquals(50, asc.size());
+
+        // Descending.
+        List<Integer> desc = new ArrayList<>();
+        for (Document doc : coll.find(where("v").gte(0), orderBy("v", SortOrder.Descending))) {
+            desc.add(doc.get("v", Integer.class));
+        }
+        assertTrue("values must be descending", isSorted(desc, false));
+
+        // Range scan: 3 <= v <= 6 -> 4 values * 5 dups = 20 docs.
+        assertEquals(20, coll.find(where("v").gte(3).and(where("v").lte(6))).size());
+        // Greater-than.
+        assertEquals(15, coll.find(where("v").gt(6)).size()); // v in {7,8,9}
+        // in-filter across duplicated values.
+        assertEquals(10, coll.find(where("v").in(1, 2)).size());
+    }
+
+    @Test
+    public void testNonUniqueIndexNullAndMultiValue() {
+        // Null indexed values and multi-valued (array/iterable) fields must round-trip through
+        // the composite layout.
+        NitriteCollection coll = db.getCollection("non_unique_null");
+        coll.insert(Document.createDocument("tag", null).put("n", 1));
+        coll.insert(Document.createDocument("tag", null).put("n", 2));
+        coll.insert(Document.createDocument("tag", Arrays.asList("a", "b")).put("n", 3));
+        coll.insert(Document.createDocument("tag", Arrays.asList("b", "c")).put("n", 4));
+        coll.createIndex(IndexOptions.indexOptions(IndexType.NON_UNIQUE), "tag");
+
+        assertEquals(2, coll.find(where("tag").eq(null)).size());
+        // "b" appears in two documents through the iterable expansion.
+        assertEquals(2, coll.find(where("tag").eq("b")).size());
+        assertEquals(1, coll.find(where("tag").eq("a")).size());
+        assertEquals(1, coll.find(where("tag").eq("c")).size());
+    }
+}

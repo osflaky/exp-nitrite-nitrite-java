@@ -1,0 +1,41 @@
+/*
+ * Copyright (c) 2017-2020. Nitrite author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.dizitart.no2.spatial.jackson;
+
+import org.dizitart.no2.spatial.GeometryUtils;
+import org.locationtech.jts.geom.Geometry;
+import tools.jackson.core.JsonGenerator;
+import tools.jackson.databind.SerializationContext;
+import tools.jackson.databind.ser.std.StdScalarSerializer;
+
+/**
+ * @since 4.0
+ * @author Anindya Chatterjee
+ */
+class GeometrySerializer extends StdScalarSerializer<Geometry> {
+
+    protected GeometrySerializer() {
+        super(Geometry.class);
+    }
+
+    @Override
+    public void serialize(Geometry value, JsonGenerator gen, SerializationContext context) {
+        if (value != null) {
+            gen.writeString(GeometryUtils.toString(value));
+        }
+    }
+}

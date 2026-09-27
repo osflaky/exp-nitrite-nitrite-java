@@ -1,0 +1,93 @@
+/*
+ * Copyright (c) 2017-2020. Nitrite author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.dizitart.no2.filters;
+
+import org.dizitart.no2.collection.Document;
+import org.dizitart.no2.collection.NitriteId;
+import org.dizitart.no2.common.DBNull;
+import org.dizitart.no2.common.DBValue;
+import org.dizitart.no2.common.tuples.Pair;
+import org.dizitart.no2.index.IndexMap;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.dizitart.no2.common.Constants.DOC_ID;
+import static org.dizitart.no2.common.util.ObjectUtils.deepEquals;
+
+/**
+ * @author Anindya Chatterjee.
+ */
+public class EqualsFilter extends ComparableFilter {
+    EqualsFilter(String field, Object value) {
+        super(field, value);
+    }
+
+    @Override
+    public boolean apply(Pair<NitriteId, Document> element) {
+        if (DOC_ID.equals(getField())) {
+            // match by NitriteId like the byId fast path, so legacy String _id
+            // written by pre-4.4 databases keeps matching (gh-1263)
+            NitriteId nitriteId = toNitriteId(getField(), getValue());
+            return nitriteId != null && nitriteId.equals(element.getFirst());
+        }
+
+        Document document = element.getSecond();
+        Object fieldValue = document.get(getField());
+        if (deepEquals(fieldValue, getValue())) {
+            return true;
+        }
+        // An array/collection field matches by element containment, mirroring
+        // applyOnIndex() (arrays are indexed element-wise). Without this,
+        // field.eq(x) on a list field returns different results depending on
+        // whether an index exists / is chosen by the planner: an indexed
+        // array-eq that the planner relegates to a collection scan (e.g. when
+        // a range filter on another field claims the index) would otherwise
+        // silently match nothing.
+        if (fieldValue instanceof Iterable) {
+            for (Object element0 : (Iterable<?>) fieldValue) {
+                if (deepEquals(element0, getValue())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public List<?> applyOnIndex(IndexMap indexMap) {
+        Object fieldValue = getValue();
+        DBValue dbValue = fieldValue == null ? DBNull.getInstance() : new DBValue((Comparable<?>) fieldValue);
+        Object value = indexMap.get(dbValue);
+        if (value == null) {
+            return new ArrayList<>();
+        }
+
+        if (value instanceof List) {
+            return ((List<?>) value);
+        }
+
+        List<Object> result = new ArrayList<>();
+        result.add(value);
+        return result;
+    }
+
+    @Override
+    public String toString() {
+        return "(" + getField() + " == " + getValue() + ")";
+    }
+}

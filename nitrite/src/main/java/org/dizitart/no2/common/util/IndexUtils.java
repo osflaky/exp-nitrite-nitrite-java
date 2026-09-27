@@ -1,0 +1,65 @@
+/*
+ * Copyright (c) 2017-2021 Nitrite author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+package org.dizitart.no2.common.util;
+
+import org.dizitart.no2.index.IndexDescriptor;
+
+import static org.dizitart.no2.common.Constants.*;
+
+/**
+ * @author Anindya Chatterjee
+ * @since 1.0
+ */
+public class IndexUtils {
+    private IndexUtils() {}
+
+    public static String deriveIndexMapName(IndexDescriptor descriptor) {
+        return INDEX_PREFIX +
+            INTERNAL_NAME_SEPARATOR +
+            descriptor.getCollectionName() +
+            INTERNAL_NAME_SEPARATOR +
+            descriptor.getFields().getEncodedName() +
+            INTERNAL_NAME_SEPARATOR +
+            descriptor.getIndexType();
+    }
+
+    /**
+     * Derives the name of the backing map for a non-unique single-field index that uses the
+     * composite-key layout (one row per {@code (value, id)} pair, see issue #1260). It is kept
+     * distinct from {@link #deriveIndexMapName(IndexDescriptor)} so the legacy array-format map
+     * can be read and migrated before being dropped.
+     */
+    public static String deriveCompositeIndexMapName(IndexDescriptor descriptor) {
+        return deriveIndexMapName(descriptor) + INTERNAL_NAME_SEPARATOR + "composite";
+    }
+
+    /**
+     * Derives the name of the map holding a unique index in its single-id layout, one
+     * {@code value -> id} entry per key.
+     *
+     * @param descriptor the index descriptor
+     * @return the map name
+     */
+    public static String deriveUniqueIndexMapName(IndexDescriptor descriptor) {
+        return deriveIndexMapName(descriptor) + INTERNAL_NAME_SEPARATOR + "unique";
+    }
+
+    public static String deriveIndexMetaMapName(String collectionName) {
+        return INDEX_META_PREFIX + INTERNAL_NAME_SEPARATOR + collectionName;
+    }
+}
